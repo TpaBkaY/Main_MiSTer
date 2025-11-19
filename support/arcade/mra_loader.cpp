@@ -52,6 +52,7 @@ struct arc_struct {
 static char arcade_error_msg[kBigTextSize] = {};
 static char arcade_root[kBigTextSize];
 static char mame_root[kBigTextSize];
+static char arcade_setname[kBigTextSize] = {};
 
 static bool is_vertical = false;
 
@@ -250,12 +251,19 @@ static int rom_data(const uint8_t *buf, int chunk, int map, struct MD5Context *m
 		return 0;
 
 	map_reg = map;
+	bool first = true;
+	int gaps = 0;
 	for (int i = 0; i < unitlen; i++)
 	{
 		if (map_reg & 0xf)
 		{
-			offsets[bytes_in_iter] = idx + (map_reg & 0xf) - 1;
+			offsets[bytes_in_iter] = idx + (map_reg & 0xf) - 1 + gaps;
 			bytes_in_iter++;
+			first = false;
+		}
+		else if(!first)
+		{
+			gaps++;
 		}
 		map_reg >>= 4;
 	}
@@ -1070,7 +1078,12 @@ static int xml_read_pre_parse(XMLEvent evt, const XMLNode* node, SXML_CHAR* text
 		break;
 
 	case XML_EVENT_TEXT:
-		if(insetname) user_io_name_override(text, samedir);
+		if(insetname)
+		{
+			user_io_name_override(text, samedir);
+			// Capture setname for game ID
+			snprintf(arcade_setname, sizeof(arcade_setname), "%s", text);
+		}
 		if(inrotation)
 		{
 			is_vertical = strncasecmp(text, "vertical", 8) == 0;
@@ -1129,6 +1142,14 @@ int arcade_send_rom(const char *xml)
 		printf("arcade_send_rom: pretty error: [%s]\n", arcade_error_msg);
 	}
 	buffer_destroy(arc_info.data);
+
+	// Write game ID using setname as serial
+	if (arcade_setname[0])
+	{
+		char mra_path[kBigTextSize];
+		snprintf(mra_path, sizeof(mra_path), "%s.mra", arcade_setname);
+		user_io_write_gameid(mra_path, 0, arcade_setname);
+	}
 
 	switches.dip_cur = switches.dip_def;
 	arcade_sw_load();

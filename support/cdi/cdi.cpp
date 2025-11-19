@@ -657,6 +657,8 @@ void subcode_data(int lba, struct subcode &out)
 		as = rem_lba / 75;
 		af = rem_lba % 75;
 
+		if (toc_entry_count == 0) // catch division by zero
+			return;
 		auto &toc_entry = toc_buffer[lba % toc_entry_count];
 
 		out.control = htons(toc_entry.control);
@@ -682,7 +684,10 @@ void subcode_data(int lba, struct subcode &out)
 
 		int track = toc.GetTrackByLBA(lba + 150);
 
-		int track_lba = lba - toc.tracks[track].start;
+		int track_lba = 0;
+		if (track < (int)ARRAY_LENGTH(toc.tracks))
+			track_lba = lba - toc.tracks[track].start;
+
 		int index = 1;
 
 		if (track_lba < 0)
@@ -699,7 +704,8 @@ void subcode_data(int lba, struct subcode &out)
 		ts = track_lba / 75;
 		tf = track_lba % 75;
 
-		out.control = htons(toc.tracks[track].type ? 0x41 : 0x01);
+		if (track < (int)ARRAY_LENGTH(toc.tracks))
+			out.control = htons(toc.tracks[track].type ? 0x41 : 0x01);
 		out.track = htons(BCD(track + 1));
 		out.index = htons(BCD(index));
 		out.mode1_mins = htons(BCD(tm));
@@ -812,7 +818,6 @@ void cdi_read_cd(uint8_t *buffer, int lba, int cnt)
 			}
 		}
 
-		check_scramble(lba, buffer);
 		buffer += CD_SECTOR_LEN;
 		subcode_data(lba, *reinterpret_cast<struct subcode *>(buffer));
 		buffer += sizeof(struct subcode);
@@ -835,11 +840,36 @@ void cdi_mount_cd(int s_index, const char *filename)
 {
 	int loaded = 0;
 
+	/// Last used directory for save file management
+	/// Must be static to keep the value between mount calls
+	static char last_dir[1024] = {};
+
 	if (strlen(filename))
 	{
 		if (load_cd_image(filename, &toc) && toc.last)
 		{
-			cdi_mount_save(filename);
+			const char *p = strrchr(filename, '/');
+			int cur_len = p ? p - filename : 0;
+			int old_len = strlen(last_dir);
+
+			int same_game = old_len && (cur_len == old_len) && !strncmp(last_dir, filename, old_len);
+
+			// Handle multi disc titles and avoid re-mounting the save file
+			// to avoid resets on the core
+			if (!same_game)
+			{
+				strncpy(last_dir, filename, sizeof(last_dir));
+				char *p = strrchr(last_dir, '/');
+				if (p)
+					*p = 0;
+				else
+					*last_dir = 0;
+
+				// FPGA side will be informed about the mount and perform a reset
+				// if configured to do so
+				cdi_mount_save(last_dir);
+			}
+
 			prepare_toc_buffer(&toc);
 			user_io_set_index(0);
 			mount_cd(toc.end * CD_SECTOR_LEN, s_index);

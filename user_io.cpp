@@ -43,6 +43,11 @@ static char core_path[1024] = {};
 static char rbf_path[1024] = {};
 
 static fileTYPE sd_image[16] = {};
+
+#define  SD_TYPE_DEFAULT 0
+#define  SD_TYPE_C64 1
+#define  SD_TYPE_A2 2
+
 static int      sd_type[16] = {};
 static int      sd_image_cangrow[16] = {};
 static uint64_t buffer_lba[16] = { ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,
@@ -1320,6 +1325,9 @@ void user_io_init(const char *path, const char *xml)
 	core_name[0] = 0;
 	disable_osd = 0;
 
+	// Clean up old game ID when loading a new core
+	unlink("/tmp/GAMEID");
+
 	// we need to set the directory to where the XML file (MRA) is
 	// not the RBF. The RBF will be in arcade, which the user shouldn't
 	// browse
@@ -2007,15 +2015,9 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 	int img_type = 0; // disk image type (for C128 core): bit 0=dual sided, 1=raw GCR supported, 2=raw MFM supported, 3=high density
 
 	sd_image_cangrow[index] = (pre != 0);
-	sd_type[index] = 0;
-
+	sd_type[index] = SD_TYPE_DEFAULT ;
 	if (len)
 	{
-		if (!strcasecmp(user_io_get_core_name(), "apple-ii"))
-		{
-			ret = dsk2nib(name, sd_image + index);
-		}
-
 		if (!ret)
 		{
 			if (x2trd_ext_supp(name))
@@ -2030,7 +2032,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 				{
 					img_type = c64_openGCR(name, sd_image + index, index);
 					ret = img_type < 0 ? 0 : 1;
-					sd_type[index] = 1;
+					sd_type[index] = SD_TYPE_C64;
 					if (!ret) FileClose(&sd_image[index]);
 
 					if (ret && is_c128())
@@ -2052,12 +2054,17 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 					{
 						img_type = c64_openGCR(name, sd_image + index, index);
 						ret = img_type < 0 ? 0 : 1;
-						sd_type[index] = 1;
+						sd_type[index] = SD_TYPE_C64;
 						if(!ret) FileClose(&sd_image[index]);
 					}
 					else if (!strcasecmp(name + len - 4, ".d81"))
 					{
 						img_type = G64_SUPPORT_HD | G64_SUPPORT_DS;
+					}
+					else if (!strcasecmp(name + len - 4, ".dsk") && ((!strcasecmp(user_io_get_core_name(), "apple-ii") || (!strcasecmp(user_io_get_core_name(), "TK2000") )) ))
+					{
+						printf("FOUND A2 DSK type\n");
+						sd_type[index] = SD_TYPE_A2;
 					}
 				}
 
@@ -2081,7 +2088,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 	}
 
 	buffer_lba[index] = -1;
-	if (!index || is_cdi()) use_save = pre;
+	if (!index || is_cdi() || (is_saturn() && index==1)) use_save = pre;
 
 	if (!ret)
 	{
@@ -2418,6 +2425,55 @@ uint32_t user_io_get_file_crc()
 	return file_crc;
 }
 
+void user_io_write_gameid(const char *filename, uint32_t crc32_val, const char *serial)
+{
+	if (!cfg.log_file_entry) return;
+
+	// Extract basename from filename
+	const char *fname = strrchr(filename, '/');
+	if (!fname) fname = filename;
+	else fname++;
+
+	// Skip BIOS files
+	if (strncasecmp(fname, "boot", 4) == 0 || strcasestr(fname, "bios"))
+	{
+		return;
+	}
+
+	FILE *f = fopen("/tmp/GAMEID", "w");
+	if (!f)
+	{
+		printf("Failed to write /tmp/GAMEID\n");
+		return;
+	}
+
+	int wrote_something = 0;
+	printf("Game ID: %s", fname);
+
+	if (crc32_val)
+	{
+		fprintf(f, "CRC32: %08X\n", crc32_val);
+		printf(" [CRC32: %08X]", crc32_val);
+		wrote_something = 1;
+	}
+	if (serial && serial[0])
+	{
+		fprintf(f, "Serial: %s\n", serial);
+		printf(" [%s]", serial);
+		wrote_something = 1;
+	}
+
+	// Ensure we always write something to the file
+	if (!wrote_something)
+	{
+		fprintf(f, "# No game ID available\n");
+	}
+
+	printf("\n");
+	fflush(f);
+	fclose(f);
+}
+
 int user_io_use_cheats()
 {
 	return use_cheats;
@@ -2724,6 +2780,8 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 
 	printf("Done.\n");
 	printf("CRC32: %08X\n", file_crc);
+
+	user_io_write_gameid(name, file_crc);
 
 	FileClose(&f);
 
@@ -3085,8 +3143,14 @@ void user_io_poll()
 				blks = 1;
 			}
 			DisableIO();
-
-			if ((blks == G64_BLOCK_COUNT_1541+1 || blks == G64_BLOCK_COUNT_1571+1) && sd_type[disk])
+			if ( sd_type[disk] == SD_TYPE_A2)
+			{
+				//if (op) printf("A2 %x %llu on %d\n", op,lba, disk);
+				if (op == 2) a2_writeDSK(&sd_image[disk], lba, ack);
+				else if (op & 1) a2_readDSK(&sd_image[disk], lba, ack);
+				else break;
+			}
+			else if ((blks == G64_BLOCK_COUNT_1541+1 || blks == G64_BLOCK_COUNT_1571+1) && sd_type[disk]==SD_TYPE_C64)
 			{
 				if (op == 2) c64_writeGCR(disk, lba, blks-1);
 				else if (op & 1) c64_readGCR(disk, lba, blks-1);
@@ -3572,6 +3636,11 @@ void user_io_poll()
 	if (is_psx()) psx_poll();
 	if (is_neogeo_cd()) neocd_poll();
 	if (is_n64()) n64_poll();
+	if (is_c64() || is_c128())
+	{
+		uint16_t save_req = spi_uio_cmd(UIO_CHK_UPLOAD);
+		if (save_req) c64_save_cart(save_req >> 8);
+	}
 	process_ss(0);
 }
 
