@@ -28,6 +28,7 @@
 #include "offload.h"
 
 #include "support.h"
+#include "support/arcade/mra_loader.h"
 #include "lib/imlib2/Imlib2.h"
 #include "lib/md5/md5.h"
 
@@ -74,7 +75,7 @@ static int brd_y = 0;
 static int menu_bg = 0;
 static int menu_bgn = 0;
 
-static VideoInfo current_video_info;
+VideoInfo current_video_info;
 
 static int support_FHD = 0;
 
@@ -99,6 +100,8 @@ static uint8_t last_vrr_mode = 0xFF;
 static float last_vrr_rate = 0.0f;
 static uint32_t last_vrr_vfp = 0;
 static uint8_t edid[256] = {};
+static uint16_t raw_edid_mfg_id = 0;
+static bool raw_edid_mfg_id_valid = false;
 
 struct vmode_t
 {
@@ -1204,7 +1207,7 @@ static void hdmi_config_set_csc()
 
 	const float pi = float(M_PI);
 
-	int ypbpr = (cfg.vga_mode_int == 1) && cfg.direct_video;
+	int ypbpr = (cfg.vga_mode_int == 1) && (cfg.direct_video == 1);
 
 	// out-of-scope defines, not used with ypbpr
 	int16_t csc_int16[12];
@@ -1403,7 +1406,7 @@ static void hdmi_config_set_csc()
 
 static void hdmi_config_init()
 {
-	int ypbpr = (cfg.vga_mode_int == 1) && cfg.direct_video;
+	int ypbpr = (cfg.vga_mode_int == 1) && (cfg.direct_video == 1);
 
 	// address, value
 	uint8_t init_data[] = {
@@ -1559,6 +1562,23 @@ static void hdmi_config_init()
 	}
 
 	hdmi_config_set_csc();
+}
+
+void video_hdmi_power(int on)
+{
+	// ADV7513 power-down control. 0 = power on, 1 = power down.
+	int fd = i2c_open(0x39, 0);
+	if (fd >= 0)
+	{
+		uint8_t val = on ? 0x00 : 0x40;
+		int res = i2c_smbus_write_byte_data(fd, 0x41, val);
+		if (res < 0) printf("i2c: write error (41 %02X): %d\n", val, res);
+		i2c_close(fd);
+	}
+	else
+	{
+		printf("*** ADV7513 not found on i2c bus! HDMI won't be available!\n");
+	}
 }
 
 static void hdmi_config_set_hdr()
@@ -1766,11 +1786,18 @@ static int is_edid_valid()
 	return !memcmp(edid, magic, sizeof(magic));
 }
 
+static void cache_raw_edid_mfg_id()
+{
+	raw_edid_mfg_id = (edid[0x08] << 8) | edid[0x09];
+	raw_edid_mfg_id_valid = true;
+}
+
 static int get_active_edid()
 {
 	int fd = i2c_open(0x39, 0);
 	if (fd < 0)
 	{
+		raw_edid_mfg_id_valid = false;
 		printf("EDID: cannot find main i2c device\n");
 		return 0;
 	}
@@ -1780,6 +1807,7 @@ static int get_active_edid()
 	if (hpd_state < 0 || !(hpd_state & 0x20))
 	{
 		i2c_close(fd);
+		raw_edid_mfg_id_valid = false;
 		return 0;
 	}
 
@@ -1793,6 +1821,7 @@ static int get_active_edid()
 	fd = i2c_open(0x3f, 0);
 	if (fd < 0)
 	{
+		raw_edid_mfg_id_valid = false;
 		printf("EDID: cannot find i2c device.\n");
 		return 0;
 	}
@@ -1807,6 +1836,7 @@ static int get_active_edid()
 
 	i2c_close(fd);
 	printf("EDID:\n"); hexdump(edid, sizeof(edid), 0);
+	cache_raw_edid_mfg_id();
 
 	if (!is_edid_valid())
 	{
@@ -2434,10 +2464,16 @@ static int should_auto_enable_direct_video()
 		get_active_edid();
 	}
 
-	if (!is_edid_valid()) return 0;
-
-	// Check manufacturer ID (bytes 0x08-0x09)
-	uint16_t mfg_id = (edid[0x08] << 8) | edid[0x09];
+	uint16_t mfg_id = 0;
+	if (is_edid_valid()) {
+		// Check manufacturer ID (bytes 0x08-0x09)
+		mfg_id = (edid[0x08] << 8) | edid[0x09];
+	} else if (raw_edid_mfg_id_valid) {
+		mfg_id = raw_edid_mfg_id;
+		printf("EDID: Invalid header, using raw manufacturer ID 0x%04X for DAC detection.\n", mfg_id);
+	} else {
+		return 0;
+	}
 
 	// Check against known DACs from config
 	for (int i = 0; i < dac_config_count; i++) {
@@ -2475,6 +2511,9 @@ static void video_mode_load()
 			// Not a DAC, use normal HDMI mode
 			cfg.direct_video = 0;
 		}
+
+		// direct_video=2 resolves here, so refresh HDMI CSC with final mode.
+		hdmi_config_set_csc();
 	}
 
 	if (cfg.direct_video && cfg.vsync_adjust)
@@ -2960,36 +2999,62 @@ static void spd_config_update()
 {
 	if (use_freesync_spd) return;
 
-	VideoInfo *vi = &current_video_info;
-	if (!vi->width) return;
-
-	uint8_t data[31] =
+	if (cfg.direct_video)
 	{
-		0x83, 0x01, 25, 0,
-		cfg.direct_video ? 'D' : 'V',
-		cfg.direct_video ? 'V' : 'I',
-		cfg.direct_video ? '1' : '1', // version
-		(uint8_t)((vi->interlaced ? 1 : 0) | (menu_present() ? 4 : 0) | (vi->rotated ? 8 : 0)),
-		(uint8_t)(vi->pixrep ? vi->pixrep : (vi->ctime / vi->width)),
-		(uint8_t)vi->de_h,
-		(uint8_t)(vi->de_h >> 8),
-		(uint8_t)vi->de_v,
-		(uint8_t)(vi->de_v >> 8),
-		(uint8_t)vi->width,
-		(uint8_t)(vi->width >> 8),
-		(uint8_t)vi->height,
-		(uint8_t)(vi->height >> 8)
-	};
+		// Custom SPD IF for additional DV1 metadata
+		VideoInfo *vi = &current_video_info;
+		if (!vi->width) return;
 
-	char *name = user_io_get_core_name2();
-	for (int i = 17; i < 31; i++)
-	{
-		if (!*name) break;
-		data[i] = (uint8_t)(*name);
-		name++;
+		uint8_t data[31] = {
+			0x83, 0x01, 25, 0,
+			'D',
+			'V',
+			'1', // version
+			(uint8_t)((vi->interlaced ? 1 : 0) | (menu_present() ? 4 : 0) | (vi->rotated ? 8 : 0) | (arcade_get_direction() << 4)),
+			(uint8_t)(vi->pixrep ? vi->pixrep : (vi->ctime / vi->width)),
+			(uint8_t)vi->de_h,
+			(uint8_t)(vi->de_h >> 8),
+			(uint8_t)vi->de_v,
+			(uint8_t)(vi->de_v >> 8),
+			(uint8_t)vi->width,
+			(uint8_t)(vi->width >> 8),
+			(uint8_t)vi->height,
+			(uint8_t)(vi->height >> 8)
+		};
+
+		char *name = user_io_get_core_name2();
+		for (int i = 17; i < 31; i++)
+		{
+			if (!*name) break;
+			data[i] = (uint8_t)(*name);
+			name++;
+		}
+
+		hdmi_spd_config(data);
 	}
+	else
+	{
+		// Standard SPD IF
+		uint8_t data[31] = {
+			0x83, 0x01, 25,                        // SPD IF header + length
+			0,                                    // Checksum, automatically calculated by ADV7513 if zero
+			'M', 'i', 'S', 'T', 'e', 'r', 0, 0, // Vendor Name (up to 8 characters)
+		};
 
-	hdmi_spd_config(data);
+		// Product Description (up to 16 characters)
+		char *name = user_io_get_core_name2();
+		for (int i = 12; i < 28; i++)
+		{
+			if (!*name) break;
+			data[i] = (uint8_t)(*name);
+			name++;
+		}
+
+		// Source Information (see ANSI/CTA-861-I, Table 35 - Source Product Description InfoFrame Data Byte 25)
+		data[28] = 0x08; // Type: Game
+
+		hdmi_spd_config(data);
+	}
 }
 
 void video_mode_adjust()
@@ -3868,6 +3933,23 @@ void video_cmd(char *cmd)
 			printf("video_cmd: unknown command or format.\n");
 		}
 	}
+}
+
+void video_mode_cmd(char *cmd)
+{
+	vmode_custom_t v = {};
+	int ret = parse_custom_video_mode(cmd, &v);
+	if (ret != -2)
+	{
+		printf("video_mode_cmd: only custom modelines are supported, got \"%s\"\n", cmd);
+		return;
+	}
+
+	v_def = v;
+	v_cur = v;
+	video_set_mode(&v, v.Fpix);
+	user_io_send_buttons(1);
+	printf("video_mode_cmd: applied mode \"%s\"\n", cmd);
 }
 
 static constexpr int CELL_GRAN_RND = 4;

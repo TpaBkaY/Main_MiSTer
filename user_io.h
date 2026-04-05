@@ -73,6 +73,8 @@
 #define UIO_GET_RUMBLE  0x3F
 #define UIO_GET_FB_PAR  0x40
 #define UIO_SET_YC_PAR  0x41
+#define UIO_GET_FR_CNT  0x42  // get frame counter
+#define UIO_GET_F12_MOD 0x43  // get framework menu key modifier
 
 // codes as used by 8bit for file loading from OSD
 #define FIO_FILE_TX     0x53
@@ -161,6 +163,8 @@
 #define EMU_JOY0  2
 #define EMU_JOY1  3
 
+#define UIO_BUFFER_SIZE 16384
+
 void user_io_init(const char *path, const char *xml);
 unsigned char user_io_core_type();
 void user_io_read_core_name();
@@ -204,7 +208,7 @@ void user_io_mouse(unsigned char b, int16_t x, int16_t y, int16_t w);
 void user_io_kbd(uint16_t key, int press);
 char* user_io_create_config_name(int with_ver = 0);
 int user_io_get_joy_transl();
-void user_io_digital_joystick(unsigned char, uint64_t, int);
+void user_io_digital_joystick(unsigned char, uint32_t, int);
 void user_io_l_analog_joystick(unsigned char, char, char);
 void user_io_r_analog_joystick(unsigned char, char, char);
 void user_io_set_joyswap(int swap);
@@ -232,9 +236,6 @@ void user_io_check_reset(unsigned short modifiers, char useKeys);
 
 void user_io_rtc_reset();
 
-void user_io_screenshot_cmd(const char *cmd);
-bool user_io_screenshot(const char *pngname, int rescale);
-
 const char* get_rbf_dir();
 const char* get_rbf_name();
 const char* get_rbf_path();
@@ -261,6 +262,7 @@ int user_io_use_cheats();
 
 int process_ss(const char *rom_name, int enable = 1);
 
+char is_f12_mod_needed();
 void diskled_on();
 #define DISKLED_ON  diskled_on()
 #define DISKLED_OFF void()
@@ -287,9 +289,14 @@ char is_saturn();
 char is_pcxt();
 char is_n64();
 char is_uneon();
+char is_atari800();
+char is_atari5200();
+char is_3do();
 
 #define HomeDir(x) user_io_get_core_path(x)
 #define CoreName user_io_get_core_name()
 #define CoreName2 user_io_get_core_name2()
+
+void screenshot_cb(void);
 
 #endif // USER_IO_H

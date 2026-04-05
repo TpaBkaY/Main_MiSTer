@@ -127,6 +127,21 @@ static uint32_t find_header(const uint8_t *data, uint32_t size)
 	return score_ex ? 0x40ffc0 : 0;
 }
 
+const char snes_cc92_header[] = {
+	0x00, 0x08, 0x22, 0x02, 0x1C, 0x00, 0x10, 0x00, 0x08, 0x65, 0x80, 0x84, 0x20, 0x00, 0x22, 0x25, 
+	0x00, 0x83, 0x0C, 0x80, 0x10, 0x00, 0x00, 0xA0, 0x80, 0x01, 0x80, 0x80, 0x00, 0x01, 0x02, 0x2D
+};
+const char snes_pf94_10k_header[] = {
+	0xC9, 0x80, 0x80, 0x44, 0x15, 0x00, 0x62, 0x09, 0x29, 0xA0, 0x52, 0x70, 0x50, 0x12, 0x05, 0x35,
+	0x31, 0x63, 0xC0, 0x22, 0x01, 0x80, 0xC2, 0x3A, 0x6C, 0xB0, 0xE8, 0x4A, 0x11, 0x20, 0xC0, 0xF8
+};
+const char snes_pf94_1m_header[] = {
+	0x50, 0x52, 0x45, 0x48, 0x49, 0x53, 0x54, 0x4F, 0x52, 0x49, 0x4B, 0x20, 0x4D, 0x41, 0x4E, 0x20,
+	0x20, 0x20, 0x20, 0x20, 0x20, 0x30, 0x00, 0x0A, 0x00, 0x01, 0x33, 0x00, 0xFF, 0xFF, 0x00, 0x00,
+	0xFF, 0xFF, 0xFF, 0xFF, 0x2B, 0x80, 0x2B, 0x80, 0x2B, 0x80, 0xFE, 0x91, 0x2B, 0x80, 0xA4, 0xF7,
+	0xFF, 0xFF, 0xFF, 0xFF, 0x2B, 0x80, 0x2B, 0x80, 0x2B, 0x80, 0x75, 0xF7, 0x00, 0x80, 0xA4, 0xF7
+};
+
 uint8_t* snes_get_header(fileTYPE *f)
 {
 	memset(hdr, 0, sizeof(hdr));
@@ -172,6 +187,15 @@ uint8_t* snes_get_header(fileTYPE *f)
 				}
 			}
 
+			bool is_cc92 = false, is_pf94 = false;
+			if (!memcmp(buf + 0x7FC0, snes_cc92_header, 32)) {
+				is_cc92 = true;
+			}
+			if (!memcmp(buf + 0x7FC0, snes_pf94_10k_header, 32) ||
+				!memcmp(buf + 0x7FC0, snes_pf94_1m_header, 64)) {
+				is_pf94 = true;
+			}
+
 			if (addr)
 			{
 				uint8_t ramsz = buf[addr + RamSize];
@@ -206,6 +230,7 @@ uint8_t* snes_get_header(fileTYPE *f)
 				if (is_bsx_bios) {
 					hdr[1] = 0x30;
 				}
+				//Sufami Turbo type 2
 				else if (is_sufami_base) {
 					hdr[1] = 0x20 | (is_sufami_turbo ? 8 : 0) | (is_sufami_bios ? 4 : 0);
 					const uint8_t rom_sz_tbl[9] = { 0,7,8,9,9,10,10,10,10 };
@@ -213,9 +238,19 @@ uint8_t* snes_get_header(fileTYPE *f)
 					romsz = buf[addr + 0x36] >= 8 ? rom_sz_tbl[8] : rom_sz_tbl[buf[addr + 0x36] & 0x0F];
 					ramsz = buf[addr + 0x37] >= 4 ? ram_sz_tbl[4] : ram_sz_tbl[buf[addr + 0x37] & 0x07];
 				}
+				//Campus Challenge '92, type E (DSP1A)
+				else if (is_cc92) {
+					hdr[1] = 0xE4;
+					ramsz = 3;
+				}
+				//PowerFest '94, type F (DSP1A)
+				else if (is_pf94) {
+					hdr[1] = 0xF4;
+					ramsz = 3;
+				}
 				else {
 
-					//DSPn types 8..B
+					//DSPn types 8..B, OBC1 type C
 					if (buf[addr + Mapper] == 0x20 && buf[addr + RomType] == 0x03)
 					{	//DSP1
 						hdr[1] |= 0x84;
@@ -294,13 +329,13 @@ uint8_t* snes_get_header(fileTYPE *f)
 						hdr[1] |= 0x70;
 					}
 
-					//1,E..F - reserved for other mappers.
+					//1 - reserved for other mappers.
 				}
 
 				hdr[2] = 0;
 
 				//PAL Regions
-				if (((buf[addr + CartRegion] >= 0x02 && buf[addr + CartRegion] <= 0x0C) || buf[addr + CartRegion] == 0x11) && !is_sufami_base)
+				if (((buf[addr + CartRegion] >= 0x02 && buf[addr + CartRegion] <= 0x0C) || buf[addr + CartRegion] == 0x11) && !is_sufami_base && !is_cc92 && !is_pf94)
 				{
 					hdr[3] |= 1;
 				}
@@ -345,6 +380,90 @@ void snes_patch_bs_header(fileTYPE *f, uint8_t *buf)
 			buf[0xFDA] = 0x33;
 		}
 	}
+}
+
+static uint32_t snes_mirror(uint32_t addr, uint32_t size)
+{
+	if (!size) return 0;
+	uint32_t base = 0;
+	// Start mask at the highest power-of-2 >= size so it covers
+	// the full address range regardless of ROM size.
+	uint32_t mask = 1u;
+	while (mask < size) mask <<= 1;
+	while (addr >= size)
+	{
+		while (mask && !(addr & mask)) mask >>= 1;
+		if (!mask) return addr % size; // fallback: should not occur
+		addr -= mask;
+		if (size > mask)
+		{
+			size -= mask;
+			base += mask;
+		}
+	mask >>= 1;
+	}
+	return base + addr;
+}
+
+static uint32_t next_pow2(uint32_t v)
+{
+	if (!v) return 1;
+	v--;
+	v |= v >> 1;
+	v |= v >> 2;
+	v |= v >> 4;
+	v |= v >> 8;
+	v |= v >> 16;
+	return v + 1;
+}
+
+uint8_t* snes_get_mirrored_rom(fileTYPE *f, uint32_t *out_size)
+{
+	uint32_t size = f->size;
+	uint8_t *rom = (uint8_t*)malloc(size);
+	if (!rom) { printf("SNES: malloc(%u) failed\n", size); return NULL; }
+
+	FileSeekLBA(f, 0);
+	if (!FileReadAdv(f, rom, size)) {
+		printf("SNES: read failed\n");
+		free(rom);
+		return NULL;
+	}
+
+	// Detect and strip 512-byte copier header (same heuristic as snes_get_header)
+	bool has_header = (size & 512) != 0;
+	if (has_header) size -= 512;
+
+	uint32_t padded = next_pow2(size);
+	if (padded == size) {
+		printf("SNES: ROM size is a power of 2 (%u bytes), no mirroring\n", size);
+		if (has_header) memmove(rom, rom + 512, size);
+		if (out_size) *out_size = size;
+		return rom;
+	}
+
+	printf("SNES: mirroring %u (0x%X) -> %u (0x%X) bytes\n", size, size, padded, padded);
+	uint8_t *data = has_header ? rom + 512 : rom;
+	uint8_t *mirrored = (uint8_t*)malloc(padded);
+	if (!mirrored) {
+		printf("SNES: malloc(%u) for mirrored buffer failed\n", padded);
+		free(rom);
+		return NULL;
+	}
+
+	memcpy(mirrored, data, size);
+	uint32_t pos = size;
+	while (pos < padded) {
+		uint32_t src = snes_mirror(pos, size);
+		uint32_t run = size - src;
+		if (run > padded - pos) run = padded - pos;
+		memcpy(mirrored + pos, data + src, run);
+		pos += run;
+	}
+
+	free(rom);
+	if (out_size) *out_size = padded;
+	return mirrored;
 }
 
 ////////////// MSU /////////////
