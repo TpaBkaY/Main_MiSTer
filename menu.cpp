@@ -248,7 +248,7 @@ const char *config_button_turbo_choice_msg[] = { "A only", "B only", "A & B" };
 const char *joy_button_map[] = { "RIGHT", "LEFT", "DOWN", "UP", "BUTTON A", "BUTTON B", "BUTTON X", "BUTTON Y", "BUTTON L", "BUTTON R", "SELECT", "START", "KBD TOGGLE", "MENU", "    Stick 1: Tilt RIGHT", "    Stick 1: Tilt DOWN", "   Mouse emu X: Tilt RIGHT", "   Mouse emu Y: Tilt DOWN" };
 const char *joy_ana_map[] = { "    DPAD test: Press RIGHT", "    DPAD test: Press DOWN", "   Stick 1 Test: Tilt RIGHT", "   Stick 1 Test: Tilt DOWN", "   Stick 2 Test: Tilt RIGHT", "   Stick 2 Test: Tilt DOWN" };
 const char *config_stereo_msg[] = { "0%", "25%", "50%", "100%" };
-const char *config_uart_msg[] = { "      None", "       PPP", "   Console", "      MIDI", "     Modem"};
+const char *config_uart_msg[] = { "      None", "       PPP", "   Console", "      MIDI", "     Modem", "UDP", "SNI"};
 const char *config_midilink_mode[] = {"Local", "Local", "  USB", "  UDP", "-----", "-----", "  USB" };
 const char *config_afilter_msg[] = { "Internal","Custom" };
 const char *config_smask_msg[] = { "None", "1x", "2x", "1x Rotated", "2x Rotated" };
@@ -593,11 +593,7 @@ static uint32_t menu_key_get(void)
 			else if(menustate < MENU_PROHIB_BTPAIR1 || menustate > MENU_PROHIB_BTPAIR2) menustate = MENU_BTPAIR;
 		}
 
-		if (!but && last_but && !longpress_consumed) 
-		{
-			c = (KEY_F12 | (user_io_osd_is_visible() ? 0 : UPSTROKE));
-			ignore_osd_release = false;
-		}
+		if (!but && last_but && !longpress_consumed) c = KEY_F12 | UPSTROKE;
 
 		if (!but) longpress_consumed = 0;
 		last_but = but;
@@ -1280,7 +1276,7 @@ void HandleUI(void)
 			}
 			break;
 		case KEY_F12 | UPSTROKE:
-			if (!user_io_osd_is_visible() && !ignore_osd_release)
+			if (!ignore_osd_release)
 				menu = true;
 			ignore_osd_release = false;
 			if(video_fb_state()) video_menu_bg(user_io_status_get("[3:1]"));
@@ -2976,10 +2972,13 @@ void HandleUI(void)
 				break;
 
 			case 15:
-				FileCreatePath(DOCS_DIR);
-				snprintf(Selected_tmp, sizeof(Selected_tmp), DOCS_DIR "/%s",user_io_get_core_name());
-				FileCreatePath(Selected_tmp);
-				SelectFile(Selected_tmp, "PDFTXTMD ",  SCANO_DIR | SCANO_TXT  , MENU_DOC_FILE_SELECTED, MENU_COMMON1);
+				snprintf(Selected_tmp, sizeof(Selected_tmp), "%s", user_io_get_core_name());
+				if (!findDocsDir(Selected_tmp, sizeof(Selected_tmp))) {
+					FileCreatePath(DOCS_DIR);
+					snprintf(Selected_tmp, sizeof(Selected_tmp), DOCS_DIR "/%s", user_io_get_core_name());
+					FileCreatePath(Selected_tmp);
+				}
+				SelectFile(Selected_tmp, "PDFTXTMD ", SCANO_DIR | SCANO_TXT, MENU_DOC_FILE_SELECTED, MENU_COMMON1);
 				break;
 
 			case 16:
@@ -3686,9 +3685,23 @@ void HandleUI(void)
             uint32_t max = (sizeof(config_uart_msg) / sizeof(config_uart_msg[0]));
 			m = 0;
 
+			int mode = GetUARTMode();
+
+			// UDP uartmode is not selectable through the menu
+			bool udp_enabled = mode == 5;
+			// SNI is only selectable if playing SNES and snid is present
+			bool sni_enabled = (mode == 6) || (is_snes() && FileExists("/media/fat/snid"));
+
+			uint32_t skipped = !udp_enabled + !sni_enabled;;
+
             for (uint32_t i = 0; i < 15; i++)
             {
-				if((i >= (14-max)/2) && (m < max))
+				// Skip drawing unselectable entries
+				while ((!udp_enabled && m == 5) || (!sni_enabled && m == 6))
+				{
+					m++;
+				}
+				if((i >= (14-(max-skipped))/2) && (m < max))
                 {
                     menumask |= 1 << m;
                     const char * uart_msg = config_uart_msg[m];
