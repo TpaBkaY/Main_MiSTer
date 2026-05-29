@@ -28,6 +28,7 @@
 #include "user_io.h"
 #include "cfg.h"
 #include "input.h"
+#include "support.h"
 #include "miniz.h"
 #include "scheduler.h"
 #include "video.h"
@@ -65,6 +66,42 @@ static int iFirstEntry = 0;
 
 static char full_path[2100];
 uint8_t loadbuf[LOADBUF_SZ];
+
+static int flist_last_first_entry()
+{
+	int last = (int)DirItem.size() - OsdGetSize();
+	return last > 0 ? last : 0;
+}
+
+static void flist_center_selected()
+{
+	int count = (int)DirItem.size();
+	if (!count || OsdGetSize() <= 0)
+	{
+		iSelectedEntry = 0;
+		iFirstEntry = 0;
+		return;
+	}
+
+	if (iSelectedEntry < 0) iSelectedEntry = 0;
+	if (iSelectedEntry >= count) iSelectedEntry = count - 1;
+
+	if (cfg.lookahead)
+	{
+		iFirstEntry = iSelectedEntry - (OsdGetSize() / 2);
+	}
+	else if (iSelectedEntry < iFirstEntry)
+	{
+		iFirstEntry = iSelectedEntry;
+	}
+	else if (iSelectedEntry >= iFirstEntry + OsdGetSize())
+	{
+		iFirstEntry = iSelectedEntry - OsdGetSize() + 1;
+	}
+
+	if (iFirstEntry < 0) iFirstEntry = 0;
+	if (iFirstEntry > flist_last_first_entry()) iFirstEntry = flist_last_first_entry();
+}
 
 fileTYPE::fileTYPE()
 {
@@ -1774,9 +1811,7 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 			if(pos>=0)
 			{
 				iSelectedEntry = pos;
-				if (iSelectedEntry + (OsdGetSize() / 2) >= flist_nDirEntries()) iFirstEntry = flist_nDirEntries() - OsdGetSize();
-				else iFirstEntry = iSelectedEntry - (OsdGetSize() / 2) + 1;
-				if (iFirstEntry < 0) iFirstEntry = 0;
+				flist_center_selected();
 			}
 		}
 		return flist_nDirEntries();
@@ -1789,8 +1824,7 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 		if (mode == SCANF_END || (mode == SCANF_PREV && iSelectedEntry <= 0))
 		{
 			iSelectedEntry = flist_nDirEntries() - 1;
-			iFirstEntry = iSelectedEntry - OsdGetSize() + 1;
-			if (iFirstEntry < 0) iFirstEntry = 0;
+			flist_center_selected();
 			return 0;
 		}
 		else if (mode == SCANF_NEXT)
@@ -1798,15 +1832,13 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 			if(iSelectedEntry + 1 < flist_nDirEntries()) // scroll within visible items
 			{
 				iSelectedEntry++;
-				// Start scrolling when cursor is cfg.lookahead positions from bottom
-				if (iSelectedEntry > iFirstEntry + OsdGetSize() - (cfg.lookahead + 1)) iFirstEntry = iSelectedEntry - OsdGetSize() + (cfg.lookahead + 1);
 			}
             else
             {
 				// jump to first visible item
-				iFirstEntry = 0;
 				iSelectedEntry = 0;
             }
+			flist_center_selected();
             return 0;
 		}
 		else if (mode == SCANF_PREV)
@@ -1814,65 +1846,20 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 			if (iSelectedEntry > 0) // scroll within visible items
 			{
 				iSelectedEntry--;
-				// Start scrolling when cursor is cfg.lookahead positions from top
-				if (iSelectedEntry < iFirstEntry + cfg.lookahead) iFirstEntry = iSelectedEntry - cfg.lookahead;
-				if (iFirstEntry < 0) iFirstEntry = 0;
+				flist_center_selected();
 			}
             return 0;
 		}
 		else if (mode == SCANF_NEXT_PAGE)
 		{
-			int last_visible = iFirstEntry + OsdGetSize() - 1;
-			if (last_visible >= flist_nDirEntries()) last_visible = flist_nDirEntries() - 1;
-			int page_stop = iFirstEntry + OsdGetSize() - (cfg.lookahead + 1);
-			if (page_stop > last_visible) page_stop = last_visible;
-			if (page_stop < iFirstEntry) page_stop = iFirstEntry;
-
-			if (iSelectedEntry < page_stop)
-			{
-				iSelectedEntry = page_stop;
-			}
-			else
-			{
-				iFirstEntry += OsdGetSize();
-				if (iFirstEntry >= flist_nDirEntries())
-				{
-					iFirstEntry = flist_nDirEntries() - OsdGetSize();
-					if (iFirstEntry < 0) iFirstEntry = 0;
-				}
-				iSelectedEntry = iFirstEntry + OsdGetSize() - (cfg.lookahead + 1);
-				if (iSelectedEntry < iFirstEntry) iSelectedEntry = iFirstEntry;
-				if (iSelectedEntry >= flist_nDirEntries()) iSelectedEntry = flist_nDirEntries() - 1;
-			}
+			iSelectedEntry += OsdGetSize();
+			flist_center_selected();
 			return 0;
 		}
 		else if (mode == SCANF_PREV_PAGE)
 		{
-			int last_visible = iFirstEntry + OsdGetSize() - 1;
-			if (last_visible >= flist_nDirEntries()) last_visible = flist_nDirEntries() - 1;
-			int page_stop = iFirstEntry + cfg.lookahead;
-			if (page_stop > last_visible) page_stop = last_visible;
-
-			if (iSelectedEntry > page_stop)
-			{
-				iSelectedEntry = page_stop;
-			}
-			else
-			{
-				if (iFirstEntry > 0)
-				{
-					iFirstEntry -= OsdGetSize();
-					if (iFirstEntry < 0) iFirstEntry = 0;
-					iSelectedEntry = iFirstEntry + cfg.lookahead;
-					last_visible = iFirstEntry + OsdGetSize() - 1;
-					if (last_visible >= flist_nDirEntries()) last_visible = flist_nDirEntries() - 1;
-					if (iSelectedEntry > last_visible) iSelectedEntry = last_visible;
-				}
-				else
-				{
-					iSelectedEntry = 0;
-				}
-			}
+			iSelectedEntry -= OsdGetSize();
+			flist_center_selected();
 		}
 		else if (mode == SCANF_SET_ITEM)
 		{
@@ -1893,9 +1880,7 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 			if(pos>=0)
 			{
 				iSelectedEntry = pos;
-				if (iSelectedEntry + (OsdGetSize() / 2) >= flist_nDirEntries()) iFirstEntry = flist_nDirEntries() - OsdGetSize();
-				else iFirstEntry = iSelectedEntry - (OsdGetSize() / 2) + 1;
-				if (iFirstEntry < 0) iFirstEntry = 0;
+				flist_center_selected();
 			}
 		}
 		else if (mode == SCANF_NEXT_CHAR)
@@ -1926,9 +1911,7 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 			if (found >= 0)
 			{
 				iSelectedEntry = found;
-				if (iSelectedEntry + (OsdGetSize() / 2) >= flist_nDirEntries()) iFirstEntry = flist_nDirEntries() - OsdGetSize();
-				else iFirstEntry = iSelectedEntry - (OsdGetSize()/2) + 1;
-				if (iFirstEntry < 0) iFirstEntry = 0;
+				flist_center_selected();
 			}
 		}
 		else if (mode == SCANF_PREV_CHAR)
@@ -1967,9 +1950,7 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 			if (found >= 0)
 			{
 				iSelectedEntry = found;
-				if (iSelectedEntry + (OsdGetSize() / 2) >= flist_nDirEntries()) iFirstEntry = flist_nDirEntries() - OsdGetSize();
-				else iFirstEntry = iSelectedEntry - (OsdGetSize()/2) + 1;
-				if (iFirstEntry < 0) iFirstEntry = 0;
+				flist_center_selected();
 			}
 		}
 		else
@@ -2003,9 +1984,7 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 				if (found >= 0)
 				{
 					iSelectedEntry = found;
-					if (iSelectedEntry + (OsdGetSize() / 2) >= flist_nDirEntries()) iFirstEntry = flist_nDirEntries() - OsdGetSize();
-					else iFirstEntry = iSelectedEntry - (OsdGetSize()/2) + 1;
-					if (iFirstEntry < 0) iFirstEntry = 0;
+					flist_center_selected();
 				}
 			}
 		}
@@ -2031,7 +2010,7 @@ int flist_iFirstEntry()
 
 void flist_iFirstEntryInc()
 {
-	iFirstEntry++;
+	if (iFirstEntry < flist_last_first_entry()) iFirstEntry++;
 }
 
 int flist_iSelectedEntry()
@@ -2144,4 +2123,177 @@ const char *FileReadLine(fileTextReader *reader)
 		}
 	}
 	return nullptr;
+}
+
+static int validAsset(const char *path, gameAssetValidator *validator)
+{
+	if (validator)
+	{
+		if (!validator->fn(path, validator->ctx)) return 0;
+	}
+	else if (!FileExists(path, 0))
+	{
+		return 0;
+	}
+
+	return 1;
+}
+
+static int findAssetByCrc(char *path, size_t path_len, uint32_t romcrc, const char *ext, const char *core_dir)
+{
+	if (!romcrc) return 0;
+
+	snprintf(path, path_len, "%s", core_dir);
+	DIR *d = opendir(path);
+	if (!d) {
+		printf("Couldn't open dir: %s\n", path);
+		return 0;
+	}
+
+	int ext_len = strlen(ext);
+	struct dirent *de;
+	while ((de = readdir(d)))
+	{
+		if (de->d_type == DT_REG) {
+			int len = strlen(de->d_name);
+			if (len < 10 + ext_len || strcasecmp(de->d_name + len - ext_len, ext)) continue;
+
+			int bracket_pos = len - 10 - ext_len;
+			if (de->d_name[bracket_pos] == '[' && de->d_name[len - ext_len - 1] == ']')
+			{
+				uint32_t crc = 0;
+				if (sscanf(de->d_name + bracket_pos + 1, "%8X", &crc) == 1)
+				{
+					if (crc == romcrc) {
+						strcat(path, "/");
+						strcat(path, de->d_name);
+						closedir(d);
+						return 1;
+					}
+				}
+			}
+		}
+	}
+
+	closedir(d);
+	return 0;
+}
+
+static int findAssetInSameDir(char *path, size_t path_len, const char *rom_path, const char *ext)
+{
+	snprintf(path, path_len, "%s", getFullPath(rom_path));
+	char *p = strrchr(path, '/'); // impossible to fail
+	*p = 0;
+
+	DIR *d = opendir(path);
+	if (!d)
+	{
+		printf("Couldn't open dir: %s\n", path);
+		return 0;
+	}
+
+	struct dirent *de;
+	while ((de = readdir(d)))
+	{
+		if (de->d_type == DT_REG)
+		{
+			int len = strlen(de->d_name);
+			if (len >= 4 && !strcasecmp(de->d_name + len - 4, ext))
+			{
+				strcat(path, "/");
+				strcat(path, de->d_name);
+				closedir(d);
+				return 1;
+			}
+		}
+	}
+
+	closedir(d);
+	return 0;
+}
+
+static bool findPsxAsset(char *path, size_t path_len, const char *rom_path, const char *ext, const char *core_dir, gameAssetValidator *validator)
+{
+	// lookup based on file name
+	const char *rom_name = strrchr(rom_path, '/');
+	if (rom_name)
+	{
+		snprintf(path, path_len, "%s%s", core_dir, rom_name);
+		char *p = strrchr(path, '.');
+		if (p) *p = 0;
+		strcat(path, ext);
+
+		if (validAsset(path, validator)) return true;
+	}
+
+	// lookup based on game ID
+	const char *game_id = psx_get_game_id();
+	if (game_id && game_id[0])
+	{
+		snprintf(path, path_len, "%s/%s%s", core_dir, game_id, ext);
+		if (validAsset(path, validator)) return true;
+	}
+
+	return false;
+}
+
+int findGameAsset(char *path, size_t path_len, const char *rom_path, uint32_t romcrc, const char *ext, const char *core_dir, const char *pcecd_dir, gameAssetValidator *validator)
+{
+	path[0] = 0;
+
+	if (!strcasestr(rom_path, ".zip"))
+	{
+		snprintf(path, path_len, "%s", getFullPath(rom_path));
+		char *p = strrchr(path, '.');
+		if (p) *p = 0;
+		strcat(path, ext);
+	}
+
+	if (validAsset(path, validator)) {
+		return 1;
+	}
+	else if (is_psx())
+	{
+		if (!findPsxAsset(path, path_len, rom_path, ext, core_dir, validator))
+		{
+			return 0;
+		}
+	}
+	else
+	{
+		if (pcecd_using_cd() || is_megacd())
+		{
+			if (findAssetInSameDir(path, path_len, rom_path, ext) && validAsset(path, validator))
+			{
+				return 1;
+			}
+		}
+
+		const char *rom_name = strrchr(rom_path, '/');
+		if (rom_name)
+		{
+			snprintf(path, path_len, "%s%s", pcecd_using_cd() ? pcecd_dir : core_dir, rom_name);
+			char *p = strrchr(path, '.');
+			if (p) *p = 0;
+			if (pcecd_using_cd() || is_megacd()) strcat(path, " []");
+			strcat(path, ext);
+
+			if (!validAsset(path, validator))
+			{
+				if (!findAssetByCrc(path, path_len, romcrc, ext, core_dir) || !validAsset(path, validator))
+				{
+					return 0;
+				}
+			}
+		}
+		else
+		{
+			if (!findAssetByCrc(path, path_len, romcrc, ext, core_dir) || !validAsset(path, validator))
+			{
+				return 0;
+			}
+		}
+	}
+
+	return 1;
 }
