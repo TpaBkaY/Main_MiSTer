@@ -1411,14 +1411,41 @@ int hdmi_has_int()
 	return has_int;
 }
 
+#define HPD_SETTLE_MS        250
+#define HPD_SETTLE_SAMPLE_MS 25
+#define HPD_REINIT_GAP_MS    2000
+#define HPD_REINIT_BURST_MAX 3
+#define HPD_REINIT_DECAY_MS  60000
+#define HPD_FALLBACK_POLL_MS 1000
+#define INT_STUCK_WINDOW_MS  3000
+#define INT_STUCK_MIN_CNT    20
+#define INT_STUCK_POLL_MS    100
+
+enum { HPD_IDLE = 0, HPD_SETTLE };
+static int           hpd_sm_state = HPD_IDLE;
+static int           hpd_level = -1, ms_level = -1;   // -1 = not yet sampled
+static unsigned long hpd_settle_tmr = 0, hpd_sample_tmr = 0, hpd_fallback_tmr = 0;
+static unsigned long hpd_reinit_guard = 0, hpd_reinit_decay = 0;
+static int           hpd_reinit_burst = 0;
+static bool          hpd_reinit_suppressed = false;
+static bool          hpd_edge_pending = false;
+static bool          hpd_edge_asleep = false;
+static bool          int_pin_usable = true;
+static unsigned long int_stuck_tmr = 0, int_stuck_poll_tmr = 0;
+static int           int_stuck_cnt = 0;
+static bool          hdmi_tx_on = true;
+
 static void hdmi_config_init()
 {
 	int ypbpr = (cfg.vga_mode_int == 1) && (cfg.direct_video == 1);
-	uint8_t int0 = hdmi_has_int() ? 0xC0 : 0x00; // HPD + SENSE
+	// int_pin_usable: a runtime stuck-INT demotion must survive reinit,
+	// or the rewritten mask re-arms an INT line nothing services anymore.
+	uint8_t int0 = (hdmi_has_int() && int_pin_usable) ? 0xC0 : 0x00; // HPD + SENSE
 
 	if (hdmi_main_fd < 0)
 	{
-		hdmi_main_fd = i2c_open(0x39, 0);
+		int adv_bus = -1;
+		hdmi_main_fd = i2c_open(0x39, 0, -1, &adv_bus);
 		if (hdmi_main_fd < 0)
 		{
 			printf("ADV7513 not found on i2c bus! HDMI won't be available!\n");
@@ -1426,15 +1453,18 @@ static void hdmi_config_init()
 		}
 		else
 		{
+			// EDID/SPD are sub-maps of the same chip: pin them to the main bus
+			// instead of rescanning, or a phantom that ACKs on another bus can
+			// capture the handle and wedge the i2c controller on a real transfer.
 			if (hdmi_edid_fd < 0)
 			{
-				hdmi_edid_fd = i2c_open(0x3f, 0);
+				hdmi_edid_fd = i2c_open(0x3f, 0, adv_bus);
 				if (hdmi_edid_fd < 0) printf("ADV7513: cannot find EDID registers.\n");
 			}
 
 			if (hdmi_spd_fd < 0)
 			{
-				hdmi_spd_fd = i2c_open(0x38, 0);
+				hdmi_spd_fd = i2c_open(0x38, 0, adv_bus);
 				if (hdmi_spd_fd < 0) printf("ADV7513: cannot find SPD registers.\n");
 			}
 		}
@@ -1657,6 +1687,13 @@ static uint8_t last_sync_invert = 0xff;
 static uint8_t last_pr_flags = 0xff;
 static uint8_t last_vic_mode = 0xff;
 
+static void hdmi_invalidate_mode_cache()
+{
+	last_sync_invert = 0xff;
+	last_pr_flags = 0xff;
+	last_vic_mode = 0xff;
+}
+
 static void hdmi_config_set_mode(vmode_custom_t *vm)
 {
 	PROFILE_FUNCTION();
@@ -1780,20 +1817,25 @@ static int find_edid_vrr_capability()
 
 }
 
-static int is_edid_valid()
+static int is_edid_valid_buf(const uint8_t *buf)
 {
 	static const uint8_t magic[] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
 	if (sizeof(edid) < sizeof(magic)) return 0;
-	return !memcmp(edid, magic, sizeof(magic));
+	return !memcmp(buf, magic, sizeof(magic));
 }
 
-static void cache_raw_edid_mfg_id()
+static int is_edid_valid()
 {
-	raw_edid_mfg_id = (edid[0x08] << 8) | edid[0x09];
+	return is_edid_valid_buf(edid);
+}
+
+static void cache_raw_edid_mfg_id(const uint8_t *buf)
+{
+	raw_edid_mfg_id = (buf[0x08] << 8) | buf[0x09];
 	raw_edid_mfg_id_valid = true;
 }
 
-static void read_edid_segment(uint8_t segment, uint8_t *buf)
+static bool read_edid_segment(uint8_t segment, uint8_t *buf)
 {
 	i2c_smbus_write_byte_data(hdmi_main_fd, 0xC4, segment);
 	i2c_smbus_write_byte_data(hdmi_main_fd, 0xC9, 0x03);
@@ -1803,27 +1845,27 @@ static void read_edid_segment(uint8_t segment, uint8_t *buf)
 	unsigned long timeout = GetTimer(500);
 	while (!CheckTimer(timeout))
 	{
-		if (i2c_smbus_read_byte_data(hdmi_main_fd, 0x96) & 4)
+		int status = i2c_smbus_read_byte_data(hdmi_main_fd, 0x96);
+		if (status >= 0 && (status & 4))
 		{
 			i2c_smbus_write_byte_data(hdmi_main_fd, 0x96, 4);
-			break;
+			for (uint16_t i = 0; i < 256; i++)
+			{
+				int value = i2c_smbus_read_byte_data(hdmi_edid_fd, (uint8_t)i);
+				buf[i] = (value < 0) ? 0 : (uint8_t)value;
+			}
+			return true;
 		}
 		usleep(10000);
 	}
 
-	for (uint16_t i = 0; i < 256; i++)
-	{
-		int value = i2c_smbus_read_byte_data(hdmi_edid_fd, (uint8_t)i);
-		buf[i] = (value < 0) ? 0 : (uint8_t)value;
-	}
+	return false;
 }
 
 static int read_edid(bool force = false)
 {
 	if (hdmi_main_fd < 0 || hdmi_edid_fd < 0) return 0;
 	if (is_edid_valid() && !force) return 1;
-
-	memset(edid, 0, sizeof(edid));
 
 	//Test if adv7513 senses hdmi clock. If not, don't bother with the edid query
 	int hpd_state = i2c_smbus_read_byte_data(hdmi_main_fd, 0x42);
@@ -1833,35 +1875,57 @@ static int read_edid(bool force = false)
 		return 0;
 	}
 
+	// read into scratch; replace live edid[] only on a valid read, so a transient failure can't blank it
+	uint8_t buf[sizeof(edid)] = {};
+	bool ddc_responded = false;
+
 	// waiting for valid EDID
 	for (int k = 0; k < 20; k++)
 	{
-		read_edid_segment(0, edid);
-		if (is_edid_valid()) break;
+		int current = i2c_smbus_read_byte_data(hdmi_main_fd, 0x42);
+		if (current < 0 || !(current & 0x20))
+		{
+			raw_edid_mfg_id_valid = false;
+			return 0;
+		}
+		bool got_interrupt = read_edid_segment(0, buf);
+		if (got_interrupt) ddc_responded = true;
+		if (is_edid_valid_buf(buf)) break;
+		if (!got_interrupt) break;  // no DDC response — display has no EDID, don't retry
 		usleep(100000);
 	}
 
-	if (is_edid_valid())
+	if (!is_edid_valid_buf(buf))
 	{
-		uint8_t max_blocks = sizeof(edid) / 256;
-		uint8_t blocks = (2 + edid[126]) / 2; // each block is 128 bytes
-		if (blocks > max_blocks) blocks = max_blocks;
-		for (uint8_t i = 1; i < blocks; i++) read_edid_segment(i, edid + (i * 256));
+		if (ddc_responded)
+		{
+			// header bad but DDC answered: still cache raw mfg id for non-conformant DAC EDIDs
+			cache_raw_edid_mfg_id(buf);
+			printf("Invalid EDID: incorrect header.\n");
+		}
+		else
+		{
+			printf("Invalid EDID: no DDC response.\n");
+		}
+		// stored edid[], not buf: only when a prior valid read is being kept
+		if (is_edid_valid()) printf("Invalid EDID: keeping last valid EDID.\n");
+
+		return 0;
 	}
+
+	uint8_t max_blocks = sizeof(edid) / 256;
+	uint8_t blocks = (2 + buf[126]) / 2; // each block is 128 bytes
+	if (blocks > max_blocks) blocks = max_blocks;
+	for (uint8_t i = 1; i < blocks; i++) read_edid_segment(i, buf + (i * 256));
+
+	memcpy(edid, buf, sizeof(edid));
 
 	printf("EDID:\n");
 	uint8_t n = edid[126] + 1;
 	if (n > sizeof(edid) / 128) n = sizeof(edid) / 128;
 	hexdump(edid, n*128, 0);
 
-	cache_raw_edid_mfg_id();
-
-	if (!is_edid_valid())
-	{
-		printf("Invalid EDID: incorrect header.\n");
-		bzero(edid, sizeof(edid));
-		return 0;
-	}
+	cache_raw_edid_mfg_id(edid);
 
 	edid_version++;
 	return 1;
@@ -2633,6 +2697,21 @@ void video_init()
 	hdmi_config_init();
 	read_edid(true);
 
+	// Adopt the link state this init just handled: video_poll's
+	// first-sample recovery is only for a link that came up after init
+	// (Monitor Sense rose late on cold boot). Sinks that are up now but
+	// have no readable EDID (DVI, VGA DACs) would otherwise pay the
+	// blocking EDID retry loop a second time on every boot.
+	if (hdmi_main_fd >= 0)
+	{
+		int st42 = i2c_smbus_read_byte_data(hdmi_main_fd, 0x42);
+		if (st42 >= 0 && (st42 & 0x60) == 0x60)
+		{
+			hpd_level = 1;
+			ms_level = 1;
+		}
+	}
+
 	hdmi_config_set_hdr();
 	video_mode_load();
 
@@ -2645,10 +2724,22 @@ void video_init()
 
 void video_reinit()
 {
+	int prev_ver = edid_version;
+	read_edid(true);
+
+	// re-read gave nothing new but a valid EDID is still held: the mode is unchanged,
+	// so don't bounce a working link (some clones can't re-lock mid-operation)
+	if (edid_version == prev_ver && is_edid_valid())
+	{
+		printf("*** Video re-init skipped: EDID unchanged.\n");
+		return;
+	}
+
 	printf("*** Video re-initialization.\n");
 
 	hdmi_config_init();
-	read_edid(true);
+	// re-init resets 0x17/0x3B/0x3C - re-apply, or video stays black if any of them changed
+	hdmi_invalidate_mode_cache();
 	hdmi_config_set_hdr();
 
 	support_FHD = 0;
@@ -2664,13 +2755,40 @@ void video_reinit()
 
 void video_hdmi_power(int on)
 {
-	// ADV7513 power-down control. 0 = power on, 1 = power down.
+	// ADV7513 power-down control: 0x41[6] = power down.
+	// Keep bit 4 set in both directions: it's a reserved bit whose power-on
+	// default is 1 and the init sequence writes 0x10; clearing it upsets
+	// some non-genuine chips.
 	if (hdmi_main_fd >= 0)
 	{
-		uint8_t val = on ? 0x00 : 0x40;
+		uint8_t val = on ? 0x10 : 0x50;
 		int res = i2c_smbus_write_byte_data(hdmi_main_fd, 0x41, val);
 		if (res < 0) printf("i2c: write error (41 %02X): %d\n", val, res);
 	}
+
+	if (on && !hdmi_tx_on)
+	{
+		// Waking from external power-down (hdmi_off): Monitor Sense dropped
+		// while the TX was down, so re-adopt the current levels silently
+		// instead of treating the recovery as a hotplug edge. Defer the
+		// first sample (fallback re-arm): right after the power-up write
+		// Monitor Sense still reads low, and adopting that transient would
+		// turn its recovery into a spurious reinit on every wake.
+		hpd_level = -1;
+		ms_level = -1;
+		hpd_sm_state = HPD_IDLE;
+		hpd_edge_pending = false;
+		hpd_fallback_tmr = GetTimer(HPD_FALLBACK_POLL_MS);
+		if (hpd_edge_asleep)
+		{
+			// HPD toggled while the TX was down: the display may have been
+			// swapped. Drop the cached EDID so the first sample re-probes
+			// it via video_poll's recovery reinit.
+			bzero(edid, sizeof(edid));
+		}
+	}
+	hpd_edge_asleep = false;
+	hdmi_tx_on = (on != 0);
 }
 
 void video_poll()
@@ -2679,36 +2797,191 @@ void video_poll()
 
 	cec_poll();
 
-	if (fpga_get_hdmi_int())
+	if (hdmi_main_fd < 0) return;
+
+	if (int_pin_usable && fpga_get_hdmi_int())
 	{
-		uint8_t irq_status = i2c_smbus_read_byte_data(hdmi_main_fd, 0x96);
-		if (irq_status == 0) return;
-
-		uint8_t clear_mask = irq_status & (0x80 | 0x40);
-		if (clear_mask) i2c_smbus_write_byte_data(hdmi_main_fd, 0x96, clear_mask);
-
-		if (irq_status & (0x80 | 0x40))
+		// While a stuck pin is suspected, rate-limit the status reads:
+		// at loop rate they would monopolize the i2c bus for the whole
+		// detection window.
+		if (!int_stuck_cnt || CheckTimer(int_stuck_poll_tmr))
 		{
-			uint8_t current_status = i2c_smbus_read_byte_data(hdmi_main_fd, 0x42);
+			int irq_status = i2c_smbus_read_byte_data(hdmi_main_fd, 0x96);
+			if (irq_status < 0) irq_status = 0; // read error: keep the polled paths below alive
 
-			bool hpd_high = (current_status & 0x40) != 0; // Bit 6: HPD pin level
-			bool MS_high = (current_status & 0x20) != 0; // Bit 5: Monitor Sense level
+			// Clear everything latched, not just HPD/MS: unmasked bits
+			// (e.g. vsync) latch too and would otherwise hold INT asserted.
+			if (irq_status) i2c_smbus_write_byte_data(hdmi_main_fd, 0x96, irq_status);
 
-			// The safe window to read EDID is when BOTH 5V power (HPD)
-			// and internal display termination (Monitor Sense) are fully high and stable
-			if (hpd_high && MS_high)
+			if (irq_status & 0xC0)
 			{
-				printf("[HDMI] HPD and Monitor Sense Stable. Power up, re-initializing...\n");
-				video_hdmi_power(1);
-				usleep(150000);
-				video_reinit();
+				int_stuck_cnt = 0;
+				// Latch the edge until a sample consumes it: an unplug or
+				// renegotiation pulse can complete inside one blocked poll
+				// gap, leaving the levels unchanged - the latched interrupt
+				// is then its only trace.
+				if (hdmi_tx_on) hpd_edge_pending = true;
+				// HPD toggled while the TX was powered down (hdmi_off):
+				// the display may have been swapped - remember it for wake.
+				else if (irq_status & 0x80) hpd_edge_asleep = true;
 			}
 			else
 			{
-				printf("[HDMI] Link lost or re-routing (HPD=%d, MS=%d)\n", hpd_high, MS_high);
-				video_hdmi_power(0);
+				// INT pin asserted with no enabled interrupt flag latched:
+				// unwired/floating INT trace or non-spec interrupt masking.
+				// Count cumulatively within the window - resetting on a
+				// momentary deassert would let a periodically re-latching
+				// phantom bit evade detection forever.
+				if (!int_stuck_cnt) int_stuck_tmr = GetTimer(INT_STUCK_WINDOW_MS);
+				int_stuck_poll_tmr = GetTimer(INT_STUCK_POLL_MS);
+				int_stuck_cnt++;
+				if (CheckTimer(int_stuck_tmr))
+				{
+					// CEC interrupts latch in 0x97 and also assert the pin;
+					// those are the CEC driver's to service, not a stuck pin.
+					if (int_stuck_cnt >= INT_STUCK_MIN_CNT &&
+					    i2c_smbus_read_byte_data(hdmi_main_fd, 0x97) <= 0)
+					{
+						printf("[HDMI] INT pin stuck/floating; switching to polled hotplug.\n");
+						int_pin_usable = false;
+						i2c_smbus_write_byte_data(hdmi_main_fd, 0x94, 0x00);
+						i2c_smbus_write_byte_data(hdmi_main_fd, 0x96, 0xFF);
+					}
+					int_stuck_cnt = 0; // window over: restart the count
+				}
 			}
 		}
+	}
+
+	// hdmi_off screensaver has the TX powered down: no hotplug actions.
+	if (!hdmi_tx_on) return;
+
+	bool sample = false;
+	if (hpd_edge_pending || hpd_sm_state == HPD_SETTLE)
+	{
+		// Edge service and settle tracking sample at a bounded rate:
+		// loop-rate i2c reads would starve the input poll.
+		if (CheckTimer(hpd_sample_tmr))
+		{
+			sample = true;
+			hpd_sample_tmr = GetTimer(HPD_SETTLE_SAMPLE_MS);
+		}
+	}
+	if (CheckTimer(hpd_fallback_tmr))
+	{
+		sample = true;
+		hpd_fallback_tmr = GetTimer(HPD_FALLBACK_POLL_MS);
+
+		if (!int_pin_usable)
+		{
+			// Demoted to polling: 0x96 still latches edges regardless of
+			// the 0x94 mask, so pulses shorter than the poll period stay
+			// visible - service the latches here.
+			int irq_status = i2c_smbus_read_byte_data(hdmi_main_fd, 0x96);
+			if (irq_status > 0)
+			{
+				i2c_smbus_write_byte_data(hdmi_main_fd, 0x96, irq_status);
+				if (irq_status & 0xC0) hpd_edge_pending = true;
+			}
+		}
+	}
+	if (!sample) return;
+
+	int st42 = i2c_smbus_read_byte_data(hdmi_main_fd, 0x42);
+	if (st42 < 0) return; // hpd_edge_pending stays armed: retried next sample
+	int hpd = (st42 >> 6) & 1; // Bit 6: HPD pin level
+	int ms = (st42 >> 5) & 1;  // Bit 5: Monitor Sense level
+	bool edge = hpd_edge_pending;
+	hpd_edge_pending = false;
+
+	if (hpd_level < 0)
+	{
+		// First sample: adopt the state video_init() already handled.
+		// Exception: link is up but the EDID is invalid (Monitor Sense
+		// rose only after init, or the display was swapped during
+		// hdmi_off) - recover with one reinit.
+		hpd_level = hpd;
+		ms_level = ms;
+		if (hpd && ms && !is_edid_valid())
+		{
+			hpd_sm_state = HPD_SETTLE;
+			hpd_settle_tmr = GetTimer(HPD_SETTLE_MS);
+		}
+		return;
+	}
+
+	bool changed = (hpd != hpd_level) || (ms != ms_level);
+	bool was_up = (hpd_level && ms_level);
+	hpd_level = hpd;
+	ms_level = ms;
+	if (!hpd)
+	{
+		// genuine unplug re-arms the reinit burst limiter
+		hpd_reinit_burst = 0;
+		hpd_reinit_suppressed = false;
+	}
+	else if (hpd_reinit_burst && CheckTimer(hpd_reinit_decay))
+	{
+		// The limiter targets rapid reinit feedback loops; sinks that
+		// never drop HPD (AVRs toggling only Monitor Sense) would stay
+		// suppressed forever, so a quiet minute also re-arms it.
+		hpd_reinit_burst = 0;
+		hpd_reinit_suppressed = false;
+	}
+
+	switch (hpd_sm_state)
+	{
+	case HPD_IDLE:
+		if ((changed || (edge && was_up)) && hpd && ms)
+		{
+			hpd_sm_state = HPD_SETTLE;
+			hpd_settle_tmr = GetTimer(HPD_SETTLE_MS);
+		}
+		else if (changed && was_up)
+		{
+			// Never power the TX down here: some non-genuine chips stop
+			// generating interrupts while powered down, turning a Monitor
+			// Sense transient into a permanent black screen.
+			printf("[HDMI] link change (HPD=%d MS=%d), keeping TX powered.\n", hpd, ms);
+		}
+		break;
+
+	case HPD_SETTLE:
+		if (changed || edge)
+		{
+			hpd_settle_tmr = GetTimer(HPD_SETTLE_MS);
+			break;
+		}
+		if (!CheckTimer(hpd_settle_tmr)) break;
+		if (!(hpd && ms))
+		{
+			hpd_sm_state = HPD_IDLE;
+			break;
+		}
+		if (!CheckTimer(hpd_reinit_guard)) break;
+		if (hpd_reinit_burst >= HPD_REINIT_BURST_MAX)
+		{
+			if (!hpd_reinit_suppressed)
+			{
+				printf("[HDMI] %d reinits without link-down; suppressing until unplug or %ds quiet.\n",
+				       hpd_reinit_burst, HPD_REINIT_DECAY_MS / 1000);
+				hpd_reinit_suppressed = true;
+			}
+			hpd_sm_state = HPD_IDLE;
+			break;
+		}
+		hpd_reinit_burst++;
+		hpd_reinit_guard = GetTimer(HPD_REINIT_GAP_MS);
+		hpd_reinit_decay = GetTimer(HPD_REINIT_DECAY_MS);
+		printf("[HDMI] link up stable (HPD=1 MS=1), re-initializing (#%d).\n", hpd_reinit_burst);
+		video_reinit();
+		// The reinit itself bounces the link (TMDS restart, EDID read);
+		// flush the self-induced latches so they don't read back as a
+		// fresh hotplug pulse and chain another reinit.
+		i2c_smbus_write_byte_data(hdmi_main_fd, 0x96, 0xFF);
+		hpd_edge_pending = false;
+		hpd_sm_state = HPD_IDLE;
+		break;
 	}
 }
 
